@@ -8,9 +8,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 	"github.com/heptio/workgroup"
-	"github.com/spiritclips/entitlements-go/metrics"
+	"github.com/matipan/metrics"
 	datadog "gopkg.in/zorkian/go-datadog-api.v2"
 )
 
