@@ -14,8 +14,8 @@ import (
 
 	"github.com/astaxie/beego"
 	"github.com/astaxie/beego/context"
-	"github.com/spiritclips/entitlements-go/metrics"
-	"github.com/spiritclips/entitlements-go/metrics/datadog"
+	"github.com/matipan/metrics"
+	"github.com/matipan/metrics/datadog"
 )
 
 const (
