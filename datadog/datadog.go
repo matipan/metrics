@@ -105,7 +105,7 @@ func (c *Client) Report() error {
 	var g workgroup.Group
 	g.Add(func(_ <-chan struct{}) error {
 		c.muEvents.Lock()
-		for k, event := range c.events {
+		for _, event := range c.events {
 			if len(event.times) == 0 {
 				continue
 			}
@@ -117,29 +117,21 @@ func (c *Client) Report() error {
 					c.logger.Debugf("Unable to post event %s: %s", *event.Title, err)
 				}
 			}
-			// clear all the times of the current event, we might loose
-			// some events on the way but it's not something we should worry
-			// about.
-			c.events[k].mu.Lock()
-			c.events[k].times = []int{}
-			c.events[k].mu.Unlock()
 		}
 		c.muEvents.Unlock()
 		return nil
 	})
 	g.Add(func(_ <-chan struct{}) error {
 		metrics := []datadog.Metric{}
-		postedCounters := []*Counter{}
 		c.muCounters.Lock()
 		// build an array of all the counters that need
 		// to be posted as metrics to datadog.
-		for k, counter := range c.counters {
-			if len(counter.datapoints) > 0 {
-				metrics = append(metrics, counter.Metric(c.host))
-				// save all the counters that will be posted since
-				// we will remove the datapoints for each of them later
-				postedCounters = append(postedCounters, c.counters[k])
+		for _, counter := range c.counters {
+			metric, ok := counter.ParseAndReset(c.host)
+			if !ok {
+				continue
 			}
+			metrics = append(metrics, metric)
 		}
 		c.muCounters.Unlock()
 
@@ -147,34 +139,19 @@ func (c *Client) Report() error {
 			c.logger.Debugf("Unable to post counters: %s", err)
 			return err
 		}
-
-		// remove the datapoints for each of the counters that
-		// was posted so that they don't get posted again in the
-		// future. This might cause us to loose a bit of information
-		// but it's not something we should worry about.
-		c.muCounters.Lock()
-		for _, counter := range postedCounters {
-			counter.mu.Lock()
-			counter.datapoints = []datadog.DataPoint{}
-			counter.mu.Unlock()
-		}
-		c.muCounters.Unlock()
-
 		return nil
 	})
 	g.Add(func(_ <-chan struct{}) error {
 		metrics := []datadog.Metric{}
-		postedHistograms := []*Histogram{}
 		c.muHistograms.Lock()
 		// build an array of all the histograms that need
 		// to be posted as metrics to datadog.
-		for k, histogram := range c.histograms {
-			if len(histogram.datapoints) > 0 {
-				metrics = append(metrics, histogram.Metric(c.host))
-				// save all the histogram that will be posted since
-				// we will remove the datapoints for each of them later
-				postedHistograms = append(postedHistograms, c.histograms[k])
+		for _, histogram := range c.histograms {
+			metric, ok := histogram.ParseAndReset(c.host)
+			if !ok {
+				continue
 			}
+			metrics = append(metrics, metric)
 		}
 		c.muHistograms.Unlock()
 
@@ -182,19 +159,6 @@ func (c *Client) Report() error {
 			c.logger.Debugf("unable to post histograms: %s", err)
 			return err
 		}
-
-		// remove the datapoints for each of the histograms that
-		// was posted so that they don't get posted again in the
-		// future. This might cause us to loose a bit of information
-		// but it's not something we should worry about.
-		c.muHistograms.Lock()
-		for _, histogram := range postedHistograms {
-			histogram.mu.Lock()
-			histogram.datapoints = []datadog.DataPoint{}
-			histogram.mu.Unlock()
-		}
-		c.muHistograms.Unlock()
-
 		return nil
 	})
 	return g.Run()
@@ -237,39 +201,50 @@ type metric struct {
 // 	addLabelValues("environment", "dev")
 // Will result in the tag: `environment:dev` when parsing
 // this metric to a datadog metric.
-func (m *metric) addLabelValues(labelValues ...string) *metric {
+func (m *metric) addLabelValues(labelValues ...string) {
 	if len(labelValues)%2 != 0 {
 		labelValues = append(labelValues, "unknown")
 	}
 	m.tags = append(m.tags, labelValues...)
-	return m
 }
 
 // addDelta adds the delta to the datapoints of this
 // metric.
-func (m *metric) addDelta(delta float64) *metric {
+func (m *metric) addDelta(delta float64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.datapoints = append(m.datapoints, datadog.DataPoint{
-		float64ptr(float64(time.Now().Unix())),
-		&delta,
-	})
-	return m
+	var added bool
+	now := float64(time.Now().Unix())
+	for _, datapoint := range m.datapoints {
+		if *datapoint[0] == now {
+			datapoint[1] = float64ptr(*datapoint[1] + delta)
+			added = true
+		}
+	}
+	if !added {
+		m.datapoints = append(m.datapoints, datadog.DataPoint{&now, &delta})
+	}
 }
 
-// Metric uses the information of our own metric to build
+// ParseAndReset uses the information of our own metric to build
 // a datadog metric, we call this function before sending
 // the metrics to the datadog api. See the `Report` function.
-func (m *metric) Metric(host string) datadog.Metric {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return datadog.Metric{
+// It also resets the metric's datapoints.
+func (m *metric) ParseAndReset(host string) (metric datadog.Metric, ok bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.datapoints) == 0 {
+		return metric, false
+	}
+	metric = datadog.Metric{
 		Metric: &m.name,
 		Tags:   buildDatadogTags(m.tags),
 		Points: m.datapoints,
 		Type:   &m.metricType,
 		Host:   &host,
 	}
+	m.datapoints = []datadog.DataPoint{}
+	return metric, true
 }
 
 // Counter implements the metrics.Counter interface
@@ -281,13 +256,13 @@ type Counter struct {
 // With returns the counter with the labelValues
 // added as key-value pair tags.
 func (c *Counter) With(labelValues ...string) metrics.Counter {
-	c.metric = c.metric.addLabelValues(labelValues...)
+	c.metric.addLabelValues(labelValues...)
 	return c
 }
 
 // Add adds the new value to the counter.
 func (c *Counter) Add(delta float64) {
-	c.metric = c.addDelta(delta)
+	c.addDelta(delta)
 }
 
 // Histogram implements the metric.Histogram interface
@@ -300,20 +275,24 @@ type Histogram struct {
 // With returns the histogram with the labelValues
 // added as key-value pair tags.
 func (h *Histogram) With(labelValues ...string) metrics.Histogram {
-	h.metric = h.metric.addLabelValues(labelValues...)
+	h.metric.addLabelValues(labelValues...)
 	return h
 }
 
 // Observe observes a new delta in the histogram.
 func (h *Histogram) Observe(delta float64) {
-	h.metric = h.metric.addDelta(delta)
+	h.metric.addDelta(delta)
 }
 
-// Metric converts this histogram into a datadog metric.
-func (h *Histogram) Metric(host string) datadog.Metric {
-	metric := h.metric.Metric(host)
+// ParseAndReset converts this histogram into a datadog metric
+// and resets the datapoints.
+func (h *Histogram) ParseAndReset(host string) (metric datadog.Metric, ok bool) {
+	metric, ok = h.metric.ParseAndReset(host)
+	if !ok {
+		return metric, false
+	}
 	metric.Unit = &h.unit
-	return metric
+	return metric, true
 }
 
 // Event implements the metrics.Event interface
@@ -349,8 +328,8 @@ func (e *Event) Register() {
 // Events returns datadog events for each the times
 // that this event was reported.
 func (e *Event) Events() []datadog.Event {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	events := []datadog.Event{}
 	for _, t := range e.times {
 		events = append(events, datadog.Event{
@@ -361,6 +340,7 @@ func (e *Event) Events() []datadog.Event {
 			Time:      &t,
 		})
 	}
+	e.times = []int{}
 	return events
 }
 
